@@ -32,18 +32,37 @@ function formatBytes(bytes: number): string {
   return \`\${val >= 10 || i === 0 ? val.toFixed(0) : val.toFixed(1)} \${units[i]}\`;
 }
 
-async function botApi<T = any>(method: string, body?: Record<string, unknown> | FormData): Promise<T> {
-  const isForm = body instanceof FormData;
+async function botApi<T = any>(method: string, body?: Record<string, unknown>): Promise<T> {
   const res = await fetch(\`https://api.telegram.org/bot\${BOT_TOKEN}/\${method}\`, {
     method: 'POST',
-    headers: isForm ? undefined : { 'Content-Type': 'application/json' },
-    body: isForm ? body : body ? JSON.stringify(body) : undefined,
+    headers: { 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined,
   });
   const json = (await res.json()) as { ok: boolean; result?: T; description?: string };
   if (!json.ok) {
     throw new Error(json.description || \`Error Bot API en \${method}\`);
   }
   return json.result as T;
+}
+
+function getChatLabelAndLink(item: Api.Message, ownerId: string) {
+  const chatId = item.chatId ? item.chatId.toString() : ownerId;
+  let chatTitle = chatId === ownerId ? 'Mensajes Guardados' : \`Chat \${chatId}\`;
+  let link: string | undefined;
+
+  const chat = item.chat;
+  if (chat instanceof Api.User) {
+    chatTitle = [chat.firstName, chat.lastName].filter(Boolean).join(' ').trim() || chatTitle;
+    if (chat.username) link = \`https://t.me/\${chat.username}/\${item.id}\`;
+  } else if (chat instanceof Api.Channel || chat instanceof Api.Chat) {
+    chatTitle = chat.title || chatTitle;
+    if (chat instanceof Api.Channel && chat.username) {
+      link = \`https://t.me/\${chat.username}/\${item.id}\`;
+    } else if (chatId.startsWith('-100')) {
+      link = \`https://t.me/c/\${chatId.slice(4)}/\${item.id}\`;
+    }
+  }
+  return { chatId, chatTitle, link };
 }
 
 async function searchAccountFiles(client: TelegramClient, text: string) {
@@ -113,7 +132,7 @@ async function main() {
   });
 
   let offset = 0;
-  console.log('[TeleFind] Bot activo mediante Long Polling (listo para Altare).');
+  console.log('[TeleFind] Bot activo mediante Long Polling (reenvío a Guardados + enlaces).');
 
   while (true) {
     try {
@@ -134,32 +153,22 @@ async function main() {
           }
 
           const data: string = cq.data || '';
-          if (data.startsWith('send:')) {
+          if (data.startsWith('fwd:')) {
             const [, chatId, msgIdStr] = data.split(':');
             const messageId = Number.parseInt(msgIdStr, 10);
             const targetChat = cq.message?.chat?.id;
-            await botApi('answerCallbackQuery', { callback_query_id: cq.id, text: 'Obteniendo archivo...' });
-
             const peer = chatId === ownerId ? 'me' : Number(chatId);
-            const [msg] = await client.getMessages(peer, { ids: [messageId] });
-            if (msg?.media && targetChat) {
-              const size = Number(msg.file?.size || 0);
-              const name = String(msg.file?.name || \`archivo_\${msg.id}\`);
-              if (size > 48 * 1024 * 1024) {
-                await client.forwardMessages('me', { messages: [msg.id], fromPeer: peer });
-                await botApi('sendMessage', {
-                  chat_id: targetChat,
-                  parse_mode: 'HTML',
-                  text: \`<b>\${escapeHtml(name)}</b> (\${formatBytes(size)}) supera 50 MB. Lo reenvié a tus <b>Mensajes Guardados</b>.\`,
-                });
-              } else {
-                const buffer = (await client.downloadMedia(msg, {})) as Buffer;
-                const form = new FormData();
-                form.append('chat_id', String(targetChat));
-                form.append('document', new Blob([new Uint8Array(buffer)]), name);
-                form.append('caption', \`\${name} (\${formatBytes(size)})\`);
-                await botApi('sendDocument', form);
-              }
+
+            await client.forwardMessages('me', { messages: [messageId], fromPeer: peer });
+            await botApi('answerCallbackQuery', {
+              callback_query_id: cq.id,
+              text: 'Reenviado a Mensajes Guardados.',
+            });
+            if (targetChat) {
+              await botApi('sendMessage', {
+                chat_id: targetChat,
+                text: 'Listo: reenvié el archivo a tus Mensajes Guardados.',
+              });
             }
           }
           continue;
@@ -184,7 +193,8 @@ async function main() {
               '<b>TeleFind Bot</b>\\n\\nEscribe cualquier palabra o usa:\\n' +
               '• <code>/buscar texto</code>\\n• <code>/pdf texto</code>\\n' +
               '• <code>/imagenes texto</code>\\n• <code>/videos texto</code>\\n' +
-              '• <code>/audio texto</code>\\n• <code>/recientes</code>',
+              '• <code>/audio texto</code>\\n• <code>/recientes</code>\\n\\n' +
+              'Cada resultado te da el enlace directo o lo reenvía a tus <b>Mensajes Guardados</b>.',
           });
           continue;
         }
@@ -198,20 +208,30 @@ async function main() {
         const lines = results.map((item, idx) => {
           const name = String(item.file?.name || \`archivo_\${item.id}\`);
           const size = formatBytes(Number(item.file?.size || 0));
-          return \`\${idx + 1}. <b>\${escapeHtml(name)}</b> · \${size}\`;
+          const { chatTitle, link } = getChatLabelAndLink(item, ownerId);
+          const linkPart = link ? \` · <a href="\${escapeHtml(link)}">Ver mensaje</a>\` : '';
+          return \`\${idx + 1}. <b>\${escapeHtml(name)}</b>\\n    \${escapeHtml(chatTitle)} · \${size}\${linkPart}\`;
         });
 
-        const inlineKeyboard = results.map((item, idx) => [
-          {
-            text: \`Enviar #\${idx + 1}: \${String(item.file?.name || 'archivo').slice(0, 32)}\`,
-            callback_data: \`send:\${item.chatId?.toString() || ownerId}:\${item.id}\`.slice(0, 64),
-          },
-        ]);
+        const inlineKeyboard = results.map((item, idx) => {
+          const { chatId, link } = getChatLabelAndLink(item, ownerId);
+          const row: Array<{ text: string; callback_data?: string; url?: string }> = [
+            {
+              text: \`A Guardados #\${idx + 1}: \${String(item.file?.name || 'archivo').slice(0, 24)}\`,
+              callback_data: \`fwd:\${chatId}:\${item.id}\`.slice(0, 64),
+            },
+          ];
+          if (link) {
+            row.push({ text: 'Abrir enlace', url: link });
+          }
+          return row;
+        });
 
         await botApi('sendMessage', {
           chat_id: msg.chat.id,
           parse_mode: 'HTML',
-          text: \`<b>Resultados (\${results.length})</b>\\n\\n\${lines.join('\\n')}\`,
+          disable_web_page_preview: true,
+          text: \`<b>Resultados (\${results.length})</b>\\n\\n\${lines.join('\\n\\n')}\`,
           reply_markup: { inline_keyboard: inlineKeyboard },
         });
       }

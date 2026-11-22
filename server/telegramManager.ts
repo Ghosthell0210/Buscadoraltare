@@ -893,48 +893,32 @@ class TelegramManager {
       }
 
       const dataStr = typeof cq.data === 'string' ? cq.data : '';
-      if (dataStr.startsWith('send:')) {
+      if (dataStr.startsWith('fwd:') || dataStr.startsWith('send:')) {
         const [, chatId, msgIdStr] = dataStr.split(':');
         const messageId = Number.parseInt(msgIdStr, 10);
         const targetChatId = cq.message?.chat?.id;
         if (!chatId || !Number.isInteger(messageId) || !targetChatId) return;
 
-        await this.botApiCall(botToken, 'answerCallbackQuery', {
-          callback_query_id: cq.id,
-          text: 'Descargando y enviando archivo...',
-        });
-
         try {
-          const { message } = await this.resolveMessage(session, chatId, messageId);
-          const meta = this.mapMessageToFileItem(session, message);
-          if (!meta) throw new Error('Archivo no disponible.');
-
-          // Telegram Bot API caps uploads at 50 MB
-          if (meta.sizeBytes > 48 * 1024 * 1024) {
-            await this.forwardToSavedMessages(session, chatId, messageId);
-            await this.botApiCall(botToken, 'sendMessage', {
-              chat_id: targetChatId,
-              parse_mode: 'HTML',
-              text: `El archivo <b>${escapeHtml(meta.fileName)}</b> (${formatBytes(meta.sizeBytes)}) supera el límite de 50 MB de la API de Bots.\nLo reenvié directamente a tus <b>Mensajes Guardados</b>.`,
-            });
-            return;
-          }
-
-          const { buffer, fileName, mimeType } = await this.downloadFileBuffer(session, chatId, messageId);
-          const form = new FormData();
-          form.append('chat_id', String(targetChatId));
-          form.append('document', new Blob([new Uint8Array(buffer)], { type: mimeType }), fileName);
-          form.append(
-            'caption',
-            `Archivo: ${fileName}\nOrigen: ${meta.chatTitle}\nTamaño: ${formatBytes(meta.sizeBytes)}`,
-          );
-
-          await this.botApiCall(botToken, 'sendDocument', form);
-        } catch (err) {
-          const errMsg = err instanceof Error ? err.message : String(err);
+          await this.forwardToSavedMessages(session, chatId, messageId);
+          await this.botApiCall(botToken, 'answerCallbackQuery', {
+            callback_query_id: cq.id,
+            text: 'Archivo reenviado a Mensajes Guardados.',
+          });
           await this.botApiCall(botToken, 'sendMessage', {
             chat_id: targetChatId,
-            text: `No se pudo enviar el archivo: ${errMsg}`,
+            text: 'Listo: reenvié el archivo a tus Mensajes Guardados.',
+          });
+        } catch (err) {
+          const errMsg = err instanceof Error ? err.message : String(err);
+          await this.botApiCall(botToken, 'answerCallbackQuery', {
+            callback_query_id: cq.id,
+            text: 'No se pudo reenviar.',
+            show_alert: true,
+          });
+          await this.botApiCall(botToken, 'sendMessage', {
+            chat_id: targetChatId,
+            text: `No se pudo reenviar el archivo: ${errMsg}`,
           });
         }
       }
@@ -968,7 +952,8 @@ class TelegramManager {
           `• <code>/imagenes texto</code> — Solo fotos e imágenes\n` +
           `• <code>/videos texto</code> — Solo videos\n` +
           `• <code>/audio texto</code> — Música y audios\n` +
-          `• <code>/recientes</code> — Últimos archivos recibidos`,
+          `• <code>/recientes</code> — Últimos archivos recibidos\n\n` +
+          `Cada resultado incluye el enlace en Telegram y un botón para reenviarlo al instante a tus <b>Mensajes Guardados</b>.`,
       });
       return;
     }
@@ -1027,19 +1012,32 @@ class TelegramManager {
 
       const lines = searchRes.items.map((item, idx) => {
         const dateStr = item.dateIso.slice(0, 10);
-        return `${idx + 1}. <b>${escapeHtml(item.fileName)}</b>\n    ${escapeHtml(item.chatTitle)} · ${formatBytes(item.sizeBytes)} · ${dateStr}`;
+        const linkPart = item.tMeLink
+          ? ` · <a href="${escapeHtml(item.tMeLink)}">Ver mensaje</a>`
+          : '';
+        return `${idx + 1}. <b>${escapeHtml(item.fileName)}</b>\n    ${escapeHtml(item.chatTitle)} · ${formatBytes(item.sizeBytes)} · ${dateStr}${linkPart}`;
       });
 
-      const inlineKeyboard = searchRes.items.map((item, idx) => [
-        {
-          text: `Enviar #${idx + 1}: ${item.fileName.slice(0, 32)}`,
-          callback_data: `send:${item.chatId}:${item.messageId}`.slice(0, 64),
-        },
-      ]);
+      const inlineKeyboard = searchRes.items.map((item, idx) => {
+        const row: Array<{ text: string; callback_data?: string; url?: string }> = [
+          {
+            text: `A Guardados #${idx + 1}: ${item.fileName.slice(0, 24)}`,
+            callback_data: `fwd:${item.chatId}:${item.messageId}`.slice(0, 64),
+          },
+        ];
+        if (item.tMeLink) {
+          row.push({
+            text: 'Abrir enlace',
+            url: item.tMeLink,
+          });
+        }
+        return row;
+      });
 
       await this.botApiCall(botToken, 'sendMessage', {
         chat_id: replyChatId,
         parse_mode: 'HTML',
+        disable_web_page_preview: true,
         text: `<b>Resultados (${searchRes.items.length})</b>${query ? ` para "${escapeHtml(query)}"` : ''}:\n\n${lines.join('\n\n')}`,
         reply_markup: { inline_keyboard: inlineKeyboard },
       });

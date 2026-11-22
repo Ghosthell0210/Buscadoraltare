@@ -139,7 +139,7 @@ export function BotControlView({
                 Bot dedicado con @BotFather
               </h2>
               <p className="text-sm text-slate-600 mt-1">
-                Chatea con tu propio bot en Telegram y recibe botones para descargar cualquier archivo encontrado.
+                Chatea con tu bot en Telegram para recibir el enlace directo del mensaje o reenviar el archivo al instante a tus Mensajes Guardados (sin descargas ni límite de tamaño).
               </p>
             </div>
             <div className="flex items-center gap-1.5 text-xs font-medium shrink-0">
